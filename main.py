@@ -1,161 +1,158 @@
 import socket
 import threading
+import pyaudio
 import time
+from cryptography.fernet import Fernet
+import argparse
 import struct
-import os
-import queue
-import numpy as np
-import sounddevice as sd
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from Crypto.Random import get_random_bytes
-
-# Конфигурация
-SAMPLE_RATE = 44100
-BLOCK_SIZE = 1024
-FORMAT = np.int16
-CHANNELS = 1
-AUDIO_TIMEOUT = 0.1
-STATS_INTERVAL = 5
-ENCRYPT_HEADER_SIZE = 16
 
 class VoiceChat:
-    def __init__(self):
+    def __init__(self, local_port, remote_host, remote_port, key):
+        # Настройки аудио
+        self.FORMAT = pyaudio.paInt16
+        self.CHANNELS = 1
+        self.RATE = 44100
+        self.CHUNK = 1024
+        
+        # Сетевые настройки
+        self.local_port = local_port
+        self.remote_host = remote_host
+        self.remote_port = remote_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.remote_addr = None
+        self.sock.bind(('0.0.0.0', local_port))
+        
+        # Шифрование
+        self.cipher = Fernet(key)
+        
+        # Статистика
+        self.sent_packets = 0
+        self.received_packets = 0
+        self.lost_packets = 0
+        self.last_sequence = 0
+        
+        # Флаги управления
         self.running = False
-        self.audio_queue = queue.Queue(maxsize=20)
-        self.stats = {
-            'sent': 0, 'received': 0, 'lost': 0, 
-            'last_seq': 0, 'start_time': time.time()
-        }
-        self.key = None
-        self.lock = threading.Lock()
+        self.audio = pyaudio.PyAudio()
         
-    def start(self, key, listen_port, remote_ip=None, remote_port=None):
-        self.key = key
-        self.sock.bind(('0.0.0.0', listen_port))
-        
-        if remote_ip and remote_port:
-            self.remote_addr = (remote_ip, remote_port)
-        
+    def start(self):
         self.running = True
-        threading.Thread(target=self._receive_thread, daemon=True).start()
-        threading.Thread(target=self._stats_thread, daemon=True).start()
+        # Поток для отправки аудио
+        send_thread = threading.Thread(target=self.send_audio)
+        send_thread.daemon = True
+        send_thread.start()
         
-        with sd.InputStream(
-            callback=self._mic_callback,
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCK_SIZE,
-            dtype=FORMAT,
-            channels=CHANNELS
-        ):
-            with sd.OutputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCK_SIZE,
-                dtype=FORMAT,
-                channels=CHANNELS,
-                callback=self._speaker_callback
-            ):
-                print("Голосовой чат запущен! Нажмите Ctrl+C для выхода.")
-                while self.running:
-                    time.sleep(1)
-    
-    def _encrypt(self, data):
-        iv = get_random_bytes(16)
-        cipher = AES.new(self.key, AES.MODE_CBC, iv)
-        return iv + cipher.encrypt(pad(data, AES.block_size))
-    
-    def _decrypt(self, data):
-        iv = data[:16]
-        cipher = AES.new(self.key, AES.MODE_CBC, iv)
-        return unpad(cipher.decrypt(data[16:]), AES.block_size)
-    
-    def _mic_callback(self, indata, frames, time_info, status):
-        if not self.remote_addr:
-            return
-            
-        timestamp = time.time()
-        seq = self.stats['sent']
-        header = struct.pack('!Id', seq, timestamp)
-        encrypted = self._encrypt(header + indata.tobytes())
-        self.sock.sendto(encrypted, self.remote_addr)
+        # Поток для приема аудио
+        receive_thread = threading.Thread(target=self.receive_audio)
+        receive_thread.daemon = True
+        receive_thread.start()
         
-        with self.lock:
-            self.stats['sent'] += 1
-    
-    def _speaker_callback(self, outdata, frames, time_info, status):
-        try:
-            data = self.audio_queue.get(timeout=AUDIO_TIMEOUT)
-            outdata[:] = np.frombuffer(data, dtype=FORMAT).reshape(-1, 1)
-        except queue.Empty:
-            outdata.fill(0)
-    
-    def _receive_thread(self):
+        # Поток для статистики
+        stats_thread = threading.Thread(target=self.show_stats)
+        stats_thread.daemon = True
+        stats_thread.start()
+        
+        send_thread.join()
+        receive_thread.join()
+        stats_thread.join()
+
+    def send_audio(self):
+        stream = self.audio.open(
+            format=self.FORMAT,
+            channels=self.CHANNELS,
+            rate=self.RATE,
+            input=True,
+            frames_per_buffer=self.CHUNK
+        )
+        
+        sequence = 0
         while self.running:
             try:
-                data, addr = self.sock.recvfrom(4096)
-                if not self.remote_addr:
-                    self.remote_addr = addr
-                
-                decrypted = self._decrypt(data)[0]
-                header = decrypted[:12]
-                audio_data = decrypted[12:]
-                
-                seq, timestamp = struct.unpack('!Id', header)
-                current_seq = self.stats['received']
-                
-                with self.lock:
-                    self.stats['received'] += 1
-                    if current_seq > 0 and seq > self.stats['last_seq'] + 1:
-                        self.stats['lost'] += seq - self.stats['last_seq'] - 1
-                    self.stats['last_seq'] = seq
-                    self.stats['delay'] = time.time() - timestamp
-                
-                self.audio_queue.put(audio_data)
+                data = stream.read(self.CHUNK)
+                # Добавляем порядковый номер
+                packet = struct.pack('!I', sequence) + data
+                # Шифруем данные
+                encrypted = self.cipher.encrypt(packet)
+                self.sock.sendto(encrypted, (self.remote_host, self.remote_port))
+                self.sent_packets += 1
+                sequence += 1
             except Exception as e:
-                print(f"Ошибка приема: {str(e)}")
-    
-    def _stats_thread(self):
-        while self.running:
-            time.sleep(STATS_INTERVAL)
-            with self.lock:
-                uptime = time.time() - self.stats['start_time']
-                loss_rate = (self.stats['lost'] / max(1, self.stats['received'])) * 100
-                print(
-                    f"Пакеты: отправлено={self.stats['sent']}, "
-                    f"получено={self.stats['received']}, "
-                    f"потеряно={self.stats['lost']} ({loss_rate:.1f}%), "
-                    f"задержка={self.stats.get('delay', 0):.3f}сек, "
-                    f"время={uptime:.0f}сек"
-                )
+                print(f"Send error: {e}")
+        
+        stream.stop_stream()
+        stream.close()
 
-def main():
-    print("==== Безопасный голосовой чат ====")
-    print("1. Создать сервер")
-    print("2. Подключиться к серверу")
-    choice = input("Выберите действие: ")
-    
-    key = get_random_bytes(16)
-    listen_port = int(input("Ваш порт для приема: "))
-    
-    if choice == '1':
-        print(f"Ваш ключ: {key.hex()}")
-        chat = VoiceChat()
-        chat.start(key, listen_port)
-    elif choice == '2':
-        remote_ip = input("IP адрес сервера: ")
-        remote_port = int(input("Порт сервера: "))
-        server_key = bytes.fromhex(input("Ключ сервера: "))
-        chat = VoiceChat()
-        chat.start(server_key, listen_port, remote_ip, remote_port)
-    else:
-        print("Неверный выбор")
+    def receive_audio(self):
+        stream = self.audio.open(
+            format=self.FORMAT,
+            channels=self.CHANNELS,
+            rate=self.RATE,
+            output=True,
+            frames_per_buffer=self.CHUNK
+        )
+        
+        while self.running:
+            try:
+                data, _ = self.sock.recvfrom(4096)
+                # Расшифровываем данные
+                decrypted = self.cipher.decrypt(data)
+                # Извлекаем порядковый номер
+                sequence = struct.unpack('!I', decrypted[:4])[0]
+                audio_data = decrypted[4:]
+                
+                # Проверяем потерю пакетов
+                if sequence > self.last_sequence + 1:
+                    self.lost_packets += sequence - self.last_sequence - 1
+                self.last_sequence = sequence
+                
+                stream.write(audio_data)
+                self.received_packets += 1
+            except Exception as e:
+                print(f"Receive error: {e}")
+        
+        stream.stop_stream()
+        stream.close()
+
+    def show_stats(self):
+        while self.running:
+            time.sleep(5)
+            print("\n--- Статистика ---")
+            print(f"Отправлено пакетов: {self.sent_packets}")
+            print(f"Получено пакетов: {self.received_packets}")
+            print(f"Потеряно пакетов: {self.lost_packets}")
+            print(f"Текущая потеря: {self.lost_packets / max(1, self.received_packets) * 100:.2f}%")
+            print("-----------------\n")
+
+    def stop(self):
+        self.running = False
+        self.sock.close()
+        self.audio.terminate()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Secure UDP Voice Chat')
+    parser.add_argument('--local_port', type=int, required=True, help='Local UDP port')
+    parser.add_argument('--remote_host', required=True, help='Remote host IP')
+    parser.add_argument('--remote_port', type=int, required=True, help='Remote UDP port')
+    parser.add_argument('--key', help='Encryption key (base64)')
+    
+    args = parser.parse_args()
+    
+    # Генерация ключа если не предоставлен
+    key = args.key or Fernet.generate_key().decode()
+    
+    if not args.key:
+        print(f"Сгенерированный ключ: {key}")
+        print("Передайте этот ключ собеседнику!")
+    
+    chat = VoiceChat(
+        local_port=args.local_port,
+        remote_host=args.remote_host,
+        remote_port=args.remote_port,
+        key=key.encode()
+    )
+    
     try:
-        main()
+        print("Запуск голосового чата... (Ctrl+C для остановки)")
+        chat.start()
     except KeyboardInterrupt:
-        print("\nПрограмма завершена")
-    except Exception as e:
-        print(f"Ошибка: {str(e)}")
+        chat.stop()
+        print("\nЧат остановлен")
