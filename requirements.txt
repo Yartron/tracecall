@@ -1,3 +1,0 @@
-numpy~=1.21.2
-sounddevice~=0.4.2
-pycryptodome~=3.10.1
